@@ -20,6 +20,9 @@ int connectTCP(const char *host, const char *service);
 #define BUFSIZE 8192
 #define MAX_CONCURRENT 5
 
+/* Variable global para control de senales */
+volatile sig_atomic_t child_terminated = 0;
+
 /* Estructura para manejo de session FTP*/
 typedef struct{
     int ctrl_sock;
@@ -44,7 +47,8 @@ int ftp_mkd(FTPSession *session, const char *dirname);
 int ftp_pwd(FTPSession *session);
 int ftp_dele(FTPSession *session, const char *filename);
 int ftp_rest(FTPSession *session, long offset);
-void handle_sigchld(int sig);
+void handle_sigchld(int sig, siginfo_t *info, void *context);
+void setup_signal_handlers(void);
 void print_help();
 int add_transfer_process(FTPSession *session, pid_t pid);
 void cleanup_finished_transfers(FTPSession *session);
@@ -59,7 +63,10 @@ int main(int argc, char *argv[]){
     char service[32];
 
     /* Configurar manejador de senales para procesos hijos*/
-    signal(SIGCHLD, handle_sigchld);
+    // signal(SIGCHLD, handle_sigchld);
+
+    /* Configurar manejadores de senales con sigaction*/
+    setup_signal_handlers();
 
     /* Validar argumentos*/
     if (argc != 3){
@@ -93,6 +100,75 @@ int main(int argc, char *argv[]){
     return 0;
 }
 
+/*-----------------------------------------------------------------------
+* setup_signal_heandlers - Configura manejadores de sanales con sigaction
+*------------------------------------------------------------------------
+*/
+void setup_signal_handlers(void){
+    struct sigaction sa;
+
+    /*Inicializar estructura sigaction*/
+    memset(&sa, 0, sizeof(sa));
+
+    /* Configurar manejadores de SIGCHILD */
+    sa.sa_sigaction = handle_sigchld; //usar version extendida
+    sa.sa_flags =   SA_SIGINFO |      //habilitar sigindo_t
+                    SA_RESTART |      //reiniciar syscalls interrumpidas
+                    SA_NOCLDSTOP;     //ignorar hijos detenidos
+
+    /* bloquea  otras senales durante el manejador*/
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGCHLD);
+
+    /* Instalar manejador*/
+    if (sigaction(SIGCHLD, &sa, NULL) == -1){
+        perror("sigaction(SIGCHLD)");
+        exit(1);
+    }
+
+    /* Ignorar SIGPIPE (conexiones rotas)*/
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGPIPE, &sa, NULL) == -1){
+        perror("sigaction(SIGPIPE)");
+        exit(1);
+    }
+
+    printf("Version con manejadores de senales con sigaction()\n");
+    
+}
+
+/* ----------------------------------------------------------
+* handle_sigchld - Manejador de senal SIGCHILD con sigaction
+*-----------------------------------------------------------
+*/
+void handle_sigchld(int sig, siginfo_t *info, void *context){
+    int saved_errno = errno;
+    pid_t pid;
+    int status;
+
+    /* Recolectar todos los procesos hijos terminados*/
+    while ((pid = waitpid(-1, &status, WNOHANG))>0){
+        /* Informacion detallada del proceso terminado*/
+        if (WIFEXITED(status)){
+            /* Proceso termino normalmente*/
+            int exit_code = WEXITSTATUS(status);
+            if (exit_code != 0){
+                const char msg[] = "[SIGCHILD] Proceso termino con error\n";
+                write(STDERR_FILENO, msg, sizeof(msg)-1);
+            }
+        }else if (WIFSIGNALED(status)){
+            /* Proceso termino por senal*/
+            const char msg[] = "[SIGCHILD] Proceso termino por senal\n";
+            write(STDERR_FILENO, msg, sizeof(msg)-1);
+        }
+        child_terminated = 1;
+    }
+    errno = saved_errno;
+}
+
 /*-------------------------------
 *TCPftp - Manejo de comandos FTP 
 *-------------------------------
@@ -106,7 +182,13 @@ int TCPftp(FTPSession *session) {
     
     while (running) {
         /* Limpiar transferencias finalizadas */
-        cleanup_finished_transfers(session);
+        if (child_terminated) {
+            cleanup_finished_transfers(session);
+            child_terminated = 0;
+        }
+
+        /* Pausa para permitir que procesos terminen*/
+        usleep(10000);
         
         printf("ftp> ");
         fflush(stdout);
@@ -122,7 +204,7 @@ int TCPftp(FTPSession *session) {
         memset(arg1, 0, sizeof(arg1));
         memset(arg2, 0, sizeof(arg2));
         
-        sscanf(input, "%s %s %s", cmd, arg1, arg2);
+        sscanf(input, "%31s %255s %255s", cmd, arg1, arg2);
         
         if (strlen(cmd) == 0)
             continue;
@@ -137,7 +219,7 @@ int TCPftp(FTPSession *session) {
                 continue;
             }
             char buffer[LINELEN];
-            sprintf(buffer, "USER %s\r\n", arg1);
+            snprintf(buffer, sizeof(buffer), "USER %s\r\n", arg1);
             ftp_send_command(session->ctrl_sock, buffer);
             ftp_read_response(session->ctrl_sock, buffer, LINELEN);
             printf("%s", buffer);
@@ -148,7 +230,7 @@ int TCPftp(FTPSession *session) {
                 continue;
             }
             char buffer[LINELEN];
-            sprintf(buffer, "PASS %s\r\n", arg1);
+            snprintf(buffer, sizeof(buffer), "PASS %s\r\n", arg1);
             ftp_send_command(session->ctrl_sock, buffer);
             ftp_read_response(session->ctrl_sock, buffer, LINELEN);
             printf("%s", buffer);
@@ -200,8 +282,34 @@ int TCPftp(FTPSession *session) {
             printf("Modo pasivo: %s\n", session->passive_mode ? "ON" : "OFF");
         }
         else if (strcmp(cmd, "status") == 0) {
-            printf("Transferencias activas: %d/%d\n", 
+            cleanup_finished_transfers(session);
+            printf("Transferencias activas: %d/%d\n",
                    session->transfer_count, MAX_CONCURRENT);
+            if (session->transfer_count >0){
+                printf("PIDs activos: ");
+                for (int i = 0; i < session->transfer_count; i++) {
+                    printf("%d ", session->active_transfers[i]);
+                }
+                printf("\n");
+            }
+        }
+        else if (strcmp(cmd, "cleanup") == 0) {
+            int before = session->transfer_count;
+            cleanup_finished_transfers(session);
+            printf("Limpieza completada. Transferencias: %d -> %d\n", 
+                   before, session->transfer_count);
+        }
+        else if (strcmp(cmd, "siginfo") == 0) {
+            /* Comando de diagnostico para mostrar info de senales */
+            struct sigaction sa;
+            sigaction(SIGCHLD, NULL, &sa);
+            printf("Configuración de SIGCHLD:\n");
+            printf("  Handler: %s\n", 
+                   sa.sa_sigaction == handle_sigchld ? "handle_sigchld()" : "otro");
+            printf("  Flags: SA_SIGINFO=%s, SA_RESTART=%s, SA_NOCLDSTOP=%s\n",
+                   (sa.sa_flags & SA_SIGINFO) ? "YES" : "NO",
+                   (sa.sa_flags & SA_RESTART) ? "YES" : "NO",
+                   (sa.sa_flags & SA_NOCLDSTOP) ? "YES" : "NO");
         }
         else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
             ftp_send_command(session->ctrl_sock, "QUIT\r\n");
@@ -314,9 +422,20 @@ int ftp_stor(FTPSession *session, const char *local_file, const char *remote_fil
     
     if (pid == 0) {
         /* Proceso hijo - realiza la transferencia */
+        /* Restaurar manejadores de senales por defecto en el hijo*/
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sigaction(SIGCHLD, &sa, NULL);
+
+        char cwd[1024];
+        getcwd(cwd, sizeof(cwd));
+
+
         FILE *fp = fopen(local_file, "rb");
         if (!fp) {
-            fprintf(stderr, "[PID %d] Error: No se puede abrir %s\n", getpid(), local_file);
+            fprintf(stderr, "[PID %d] Error: No se puede abrir '%s'\n", getpid(), local_file);
+            fprintf(stderr, "[PID %d] Directorio actual: %s\n", getpid(), cwd);
+            fprintf(stderr, "[PID %d] Error: %s\n", getpid(), strerror(errno));
             exit(1);
         }
         
@@ -389,9 +508,20 @@ int ftp_retr(FTPSession *session, const char *remote_file, const char *local_fil
     
     if (pid == 0) {
         /* Proceso hijo */
+        /* Restaurar manejadores de senales por defecto*/
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_DFL;
+        sigaction(SIGCHLD, &sa, NULL);
+        
+        char cwd[1024];
+        getcwd(cwd, sizeof(cwd));
+
         FILE *fp = fopen(local_file, "wb");
         if (!fp) {
-            fprintf(stderr, "[PID %d] Error: No se puede crear %s\n", getpid(), local_file);
+            fprintf(stderr, "[PID %d] Error: No se puede crear '%s'\n", getpid(), local_file);
+            fprintf(stderr, "[PID %d] Directorio actual: %s\n", getpid(), cwd);
+            fprintf(stderr, "[PID %d] Error: %s\n", getpid(), strerror(errno));
             exit(1);
         }
         
@@ -554,11 +684,11 @@ void cleanup_finished_transfers(FTPSession *session) {
  * handle_sigchld - Manejador de senal para procesos hijo
  *--------------------------------------------------------
  */
-void handle_sigchld(int sig) {
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-    errno = saved_errno;
-}
+// void handle_sigchld(int sig) {
+//     int saved_errno = errno;
+//     while (waitpid(-1, NULL, WNOHANG) > 0);
+//     errno = saved_errno;
+// } //se usaba con signal(), ahora se usa sigaction()
 
 /*---------------------------------------
  * print_help - Muestra ayuda de comandos
@@ -578,6 +708,8 @@ void handle_sigchld(int sig) {
     printf("  dele <filename>         - Eliminar archivo\n");
     printf("  passive                 - Alternar modo pasivo\n");
     printf("  status                  - Ver transferencias activas\n");
+    printf("  cleanup                 - Limpiar procesos terminados\n");
+    printf("  siginfo                 - Mostrar info de señales (debug)\n");
     printf("  help                    - Mostrar esta ayuda\n");
     printf("  quit                    - Salir\n");
     printf("\nNota: Soporta hasta %d transferencias concurrentes\n", MAX_CONCURRENT);

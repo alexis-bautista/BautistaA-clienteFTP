@@ -1,4 +1,8 @@
-clienteFTP
+BautistaA-clienteFTP
 connectsock.c
 connectTCP.c
 errexit.c
+BautistaA-clienteFTP.o
+connectsock.o
+connectTCP.o
+errexit.o
